@@ -25,6 +25,19 @@ from .utils import (
 )
 
 
+CATEGORY_TYPES = {
+    'video': 1,
+    'audio': 2,
+    'image': 3,
+    'doc': 4,
+    'document': 4,
+    'app': 5,
+    'other': 6,
+    'bt': 7,
+    'torrent': 7,
+}
+
+
 class BaiduNetdiskClient:
     def __init__(self, cfg: Config, via_proxy: bool = False):
         self.cfg = cfg
@@ -107,17 +120,108 @@ class BaiduNetdiskClient:
     # Directory operations
     # ------------------------------------------------------------------
 
-    def list_dir(self, path: str, limit: int = 1000) -> list:
+    def _category_id(self, category) -> int:
+        if isinstance(category, int):
+            return category
+        value = str(category).strip().lower()
+        if value.isdigit():
+            return int(value)
+        if value not in CATEGORY_TYPES:
+            raise NetdiskError(f'Unknown file type: {category}')
+        return CATEGORY_TYPES[value]
+
+    def list_dir(
+        self,
+        path: str,
+        limit: int = 1000,
+        order: str = 'name',
+        desc: bool = False,
+        start: int = 0,
+        dirs_only: bool = False,
+        showempty: bool = False,
+        web: bool = True,
+    ) -> list:
         app_path = self.resolve_app_path(path)
         data = self._json(self._get(XPAN_FILE_URL, {
             'method': 'list',
             'dir': app_path,
-            'order': 'name',
-            'desc': 0,
-            'start': 0,
+            'order': order,
+            'desc': 1 if desc else 0,
+            'start': start,
             'limit': limit,
-            'web': 'web',
-            'folder': 0,
+            'web': 1 if web else 0,
+            'folder': 1 if dirs_only else 0,
+            'showempty': 1 if showempty else 0,
+        }))
+        return data.get('list', [])
+
+    def list_all(
+        self,
+        path: str = '.',
+        recursive: bool = True,
+        limit: int = 1000,
+        order: str = 'name',
+        desc: bool = False,
+        start: int = 0,
+    ) -> list:
+        app_path = self.resolve_app_path(path)
+        data = self._json(self._get(XPAN_MULTIMEDIA_URL, {
+            'method': 'listall',
+            'path': app_path,
+            'recursion': 1 if recursive else 0,
+            'order': order,
+            'desc': 1 if desc else 0,
+            'start': start,
+            'limit': limit,
+            'web': 1,
+        }))
+        return data.get('list', [])
+
+    def search(
+        self,
+        key: str,
+        path: str = '.',
+        recursive: bool = False,
+        category=None,
+        page: int = 1,
+        num: int = 500,
+    ) -> list:
+        if not key:
+            raise NetdiskError('Search keyword cannot be empty')
+        params = {
+            'method': 'search',
+            'key': key,
+            'dir': self.resolve_app_path(path),
+            'recursion': 1 if recursive else 0,
+            'page': page,
+            'num': num,
+            'web': 1,
+        }
+        if category is not None:
+            params['category'] = self._category_id(category)
+        data = self._json(self._get(XPAN_FILE_URL, params))
+        return data.get('list', [])
+
+    def category_list(
+        self,
+        category,
+        path: str = '.',
+        recursive: bool = False,
+        page: int = 1,
+        num: int = 500,
+        order: str = 'time',
+        desc: bool = True,
+    ) -> list:
+        data = self._json(self._get(XPAN_MULTIMEDIA_URL, {
+            'method': 'categorylist',
+            'category': self._category_id(category),
+            'parent_path': self.resolve_app_path(path),
+            'recursion': 1 if recursive else 0,
+            'page': page,
+            'num': num,
+            'order': order,
+            'desc': 1 if desc else 0,
+            'web': 1,
         }))
         return data.get('list', [])
 
@@ -169,6 +273,37 @@ class BaiduNetdiskClient:
     # File operations
     # ------------------------------------------------------------------
 
+    def file_meta(
+        self,
+        path: str,
+        dlink: bool = False,
+        thumb: bool = False,
+        extra: bool = False,
+        needmedia: bool = False,
+        detail: bool = False,
+    ) -> dict:
+        basic = self.meta(path)
+        if not basic:
+            raise NetdiskError(f'Remote path does not exist: {path}')
+        fsid = basic.get('fs_id') or basic.get('fsid')
+        if not fsid:
+            return basic
+        data = self._json(self._get(XPAN_MULTIMEDIA_URL, {
+            'method': 'filemetas',
+            'fsids': json.dumps([int(fsid)]),
+            'dlink': 1 if dlink else 0,
+            'thumb': 1 if thumb else 0,
+            'extra': 1 if extra else 0,
+            'needmedia': 1 if needmedia else 0,
+            'detail': 1 if detail else 0,
+        }))
+        items = data.get('list', [])
+        if not items:
+            return basic
+        merged = dict(basic)
+        merged.update(items[0])
+        return merged
+
     def delete(self, path: str):
         app_path = self.resolve_app_path(path)
         if app_path == '/':
@@ -177,6 +312,60 @@ class BaiduNetdiskClient:
             XPAN_FILE_URL,
             {'method': 'filemanager', 'opera': 'delete'},
             data={'async': '0', 'filelist': json.dumps([{'path': app_path}], ensure_ascii=False)},
+        ))
+
+    def _api_dst_parent(self, src_path: str, dst_parent: str) -> str:
+        if src_path.startswith(self.cfg.app_root.rstrip('/') + '/'):
+            return self.cfg.app_root.rstrip('/') + dst_parent
+        if src_path == self.cfg.app_root:
+            return (
+                self.cfg.app_root if dst_parent == '/'
+                else self.cfg.app_root.rstrip('/') + dst_parent
+            )
+        return dst_parent
+
+    def copy(self, src: str, dst: str):
+        src_path = self.resolve_app_path(src)
+        if src_path == '/':
+            raise NetdiskError('Refusing to copy app root / for safety')
+        src_meta = self.meta(src_path)
+        if not src_meta:
+            raise NetdiskError(f'Remote path does not exist: {src}')
+
+        dst_meta = self.meta(dst)
+        if dst.endswith('/') or (dst_meta and _is_dir(dst_meta)):
+            base = os.path.basename(src_path.rstrip('/'))
+            dst_path = normalize_app_path(self.resolve_app_path(dst).rstrip('/') + '/' + base)
+        else:
+            dst_path = self.resolve_app_path(dst)
+
+        if dst_path == '/':
+            raise NetdiskError('Refusing to overwrite app root / for safety')
+        if src_path == dst_path:
+            raise NetdiskError('Cannot copy a path onto itself')
+        if _is_dir(src_meta) and dst_path.startswith(src_path.rstrip('/') + '/'):
+            raise NetdiskError('Cannot copy a directory into itself')
+
+        existing_dst = self.meta(dst_path)
+        if existing_dst and _is_dir(existing_dst) and not _is_dir(src_meta):
+            raise NetdiskError(f'Destination is a directory: {dst}')
+
+        dst_parent = normalize_app_path(os.path.dirname(dst_path))
+        new_name = os.path.basename(dst_path)
+        self._json(self._post(
+            XPAN_FILE_URL,
+            {'method': 'filemanager', 'opera': 'copy'},
+            data={
+                'async': '0',
+                'filelist': json.dumps([
+                    {
+                        'path': src_path,
+                        'dest': self._api_dst_parent(src_path, dst_parent),
+                        'newname': new_name,
+                        'ondup': 'overwrite',
+                    }
+                ], ensure_ascii=False),
+            },
         ))
 
     def move(self, src: str, dst: str):
@@ -224,23 +413,18 @@ class BaiduNetdiskClient:
             ))
             return
 
-        # Cross-directory move
-        if src_path.startswith(self.cfg.app_root.rstrip('/') + '/'):
-            api_dst_parent = self.cfg.app_root.rstrip('/') + dst_parent
-        elif src_path == self.cfg.app_root:
-            api_dst_parent = (
-                self.cfg.app_root if dst_parent == '/'
-                else self.cfg.app_root.rstrip('/') + dst_parent
-            )
-        else:
-            api_dst_parent = dst_parent
         self._json(self._post(
             XPAN_FILE_URL,
             {'method': 'filemanager', 'opera': 'move'},
             data={
                 'async': '0',
                 'filelist': json.dumps([
-                    {'path': src_path, 'dest': api_dst_parent, 'newname': new_name, 'ondup': 'overwrite'}
+                    {
+                        'path': src_path,
+                        'dest': self._api_dst_parent(src_path, dst_parent),
+                        'newname': new_name,
+                        'ondup': 'overwrite',
+                    }
                 ], ensure_ascii=False),
             },
         ))
@@ -386,6 +570,29 @@ class BaiduNetdiskClient:
     # ------------------------------------------------------------------
     # Tree (recursive) operations
     # ------------------------------------------------------------------
+
+    def list_tree(self, remote: str = '.', max_depth: Optional[int] = None, dirs_only: bool = False) -> list:
+        root_path = self.resolve_app_path(remote)
+        root_meta = self.meta(root_path)
+        if not root_meta:
+            raise NetdiskError(f'Remote path does not exist: {remote}')
+        entries = [(0, root_meta)]
+        if not _is_dir(root_meta):
+            return entries
+
+        def _walk(path: str, depth: int):
+            if max_depth is not None and depth >= max_depth:
+                return
+            for item in self.list_dir(path, dirs_only=dirs_only):
+                entries.append((depth + 1, item))
+                if _is_dir(item):
+                    child = item.get('path') or normalize_app_path(
+                        path.rstrip('/') + '/' + item.get('server_filename', '')
+                    )
+                    _walk(child, depth + 1)
+
+        _walk(root_path, 0)
+        return entries
 
     def download_tree(self, remote: str, local: str):
         m = self.meta(remote)

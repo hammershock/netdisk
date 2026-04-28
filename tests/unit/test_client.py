@@ -162,6 +162,76 @@ class TestListDir:
         assert params['dir'] == '/target'
         assert params['method'] == 'list'
 
+    def test_sends_enhanced_options(self, client):
+        client.session.get.return_value = _ok_response({'errno': 0, 'list': []})
+        client.list_dir(
+            '/target',
+            limit=10,
+            order='time',
+            desc=True,
+            start=5,
+            dirs_only=True,
+            showempty=True,
+            web=False,
+        )
+        params = client.session.get.call_args[1]['params']
+        assert params['order'] == 'time'
+        assert params['desc'] == 1
+        assert params['start'] == 5
+        assert params['limit'] == 10
+        assert params['folder'] == 1
+        assert params['showempty'] == 1
+        assert params['web'] == 0
+
+
+# ---------------------------------------------------------------------------
+# list_all / search / category
+# ---------------------------------------------------------------------------
+
+class TestDiscoveryApis:
+    def test_list_all_sends_recursive_params(self, client):
+        client.session.get.return_value = _ok_response({'errno': 0, 'list': []})
+        client.list_all('/target', recursive=True, order='size', desc=True, start=2, limit=50)
+        params = client.session.get.call_args[1]['params']
+        assert params['method'] == 'listall'
+        assert params['path'] == '/target'
+        assert params['recursion'] == 1
+        assert params['order'] == 'size'
+        assert params['desc'] == 1
+        assert params['start'] == 2
+        assert params['limit'] == 50
+
+    def test_search_sends_keyword_path_recursion_and_category(self, client):
+        client.session.get.return_value = _ok_response({'errno': 0, 'list': []})
+        client.search('report', path='/docs', recursive=True, category='doc', page=2, num=20)
+        params = client.session.get.call_args[1]['params']
+        assert params['method'] == 'search'
+        assert params['key'] == 'report'
+        assert params['dir'] == '/docs'
+        assert params['recursion'] == 1
+        assert params['category'] == 4
+        assert params['page'] == 2
+        assert params['num'] == 20
+
+    def test_search_rejects_empty_keyword(self, client):
+        with pytest.raises(NetdiskError, match='keyword'):
+            client.search('')
+
+    def test_category_list_sends_type_and_parent_path(self, client):
+        client.session.get.return_value = _ok_response({'errno': 0, 'list': []})
+        client.category_list('image', path='/photos', recursive=True, page=3, num=30)
+        params = client.session.get.call_args[1]['params']
+        assert params['method'] == 'categorylist'
+        assert params['category'] == 3
+        assert params['parent_path'] == '/photos'
+        assert params['recursion'] == 1
+        assert params['page'] == 3
+        assert params['num'] == 30
+
+    def test_unknown_category_raises(self, client):
+        with pytest.raises(NetdiskError, match='Unknown file type'):
+            client.category_list('nonsense')
+
 
 # ---------------------------------------------------------------------------
 # meta
@@ -195,6 +265,30 @@ class TestMeta:
         client.session.get.return_value = _error_response(-6, 'permission denied')
         with pytest.raises(NetdiskError):
             client.meta('/some_dir/target.txt')
+
+    def test_file_meta_merges_filemetas_response(self, client):
+        file_item = {'server_filename': 'target.txt', 'isdir': 0, 'size': 42, 'fs_id': 123}
+
+        def fake_get(url, params=None, **kwargs):
+            params = params or {}
+            if params.get('method') == 'filemetas':
+                return _ok_response({'errno': 0, 'list': [{'fs_id': 123, 'dlink': 'http://fake'}]})
+            return _ok_response({'errno': 0, 'list': [file_item]})
+
+        client.session.get.side_effect = fake_get
+        result = client.file_meta('/some_dir/target.txt', dlink=True, thumb=True)
+        assert result['server_filename'] == 'target.txt'
+        assert result['dlink'] == 'http://fake'
+        filemetas_params = client.session.get.call_args_list[-1][1]['params']
+        assert filemetas_params['method'] == 'filemetas'
+        assert filemetas_params['fsids'] == '[123]'
+        assert filemetas_params['dlink'] == 1
+        assert filemetas_params['thumb'] == 1
+
+    def test_file_meta_raises_if_missing(self, client):
+        client.session.get.return_value = _ok_response({'errno': 0, 'list': []})
+        with pytest.raises(NetdiskError, match='does not exist'):
+            client.file_meta('/missing.txt')
 
 
 # ---------------------------------------------------------------------------
@@ -231,6 +325,51 @@ class TestDelete:
         call_kwargs = client.session.post.call_args
         params = call_kwargs[1]['params']
         assert params['opera'] == 'delete'
+
+
+# ---------------------------------------------------------------------------
+# copy
+# ---------------------------------------------------------------------------
+
+class TestCopy:
+    def _setup_meta(self, client, items_by_parent: dict):
+        def fake_get(url, params=None, **kwargs):
+            dir_path = (params or {}).get('dir', '')
+            items = items_by_parent.get(dir_path, [])
+            return _ok_response({'errno': 0, 'list': items})
+        client.session.get.side_effect = fake_get
+
+    def test_refuses_to_copy_root(self, client):
+        with pytest.raises(NetdiskError, match='Refusing to copy'):
+            client.copy('/', '/dst')
+
+    def test_raises_if_src_missing(self, client):
+        client.session.get.return_value = _ok_response({'errno': 0, 'list': []})
+        with pytest.raises(NetdiskError, match='does not exist'):
+            client.copy('/missing', '/dst')
+
+    def test_refuses_copy_onto_self(self, client):
+        self._setup_meta(client, {
+            '/': [{'server_filename': 'f', 'isdir': 0}],
+        })
+        with pytest.raises(NetdiskError, match='onto itself'):
+            client.copy('/f', '/f')
+
+    def test_sends_copy_filemanager_request(self, client):
+        self._setup_meta(client, {
+            '/': [{'server_filename': 'a.txt', 'isdir': 0}],
+        })
+        client.session.post.return_value = _ok_response({'errno': 0})
+        client.copy('/a.txt', '/b.txt')
+        call_kwargs = client.session.post.call_args
+        assert call_kwargs[1]['params']['opera'] == 'copy'
+        payload = json.loads(call_kwargs[1]['data']['filelist'])
+        assert payload == [{
+            'path': '/a.txt',
+            'dest': '/',
+            'newname': 'b.txt',
+            'ondup': 'overwrite',
+        }]
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +417,44 @@ class TestMove:
         client.move('/a.txt', '/b.txt')
         call_kwargs = client.session.post.call_args
         assert call_kwargs[1]['params']['opera'] == 'rename'
+
+
+# ---------------------------------------------------------------------------
+# tree
+# ---------------------------------------------------------------------------
+
+class TestListTree:
+    def test_returns_depth_item_pairs(self, client):
+        def fake_get(url, params=None, **kwargs):
+            dir_path = (params or {}).get('dir', '')
+            items_by_parent = {
+                '/': [
+                    {'server_filename': 'dir', 'path': '/dir', 'isdir': 1},
+                    {'server_filename': 'f.txt', 'path': '/f.txt', 'isdir': 0},
+                ],
+                '/dir': [
+                    {'server_filename': 'nested.txt', 'path': '/dir/nested.txt', 'isdir': 0},
+                ],
+            }
+            return _ok_response({'errno': 0, 'list': items_by_parent.get(dir_path, [])})
+
+        client.session.get.side_effect = fake_get
+        entries = client.list_tree('/', max_depth=2)
+        assert [depth for depth, _ in entries] == [0, 1, 2, 1]
+        assert [item['server_filename'] for _, item in entries[1:]] == ['dir', 'nested.txt', 'f.txt']
+
+    def test_respects_max_depth(self, client):
+        def fake_get(url, params=None, **kwargs):
+            dir_path = (params or {}).get('dir', '')
+            items_by_parent = {
+                '/': [{'server_filename': 'dir', 'path': '/dir', 'isdir': 1}],
+                '/dir': [{'server_filename': 'nested.txt', 'path': '/dir/nested.txt', 'isdir': 0}],
+            }
+            return _ok_response({'errno': 0, 'list': items_by_parent.get(dir_path, [])})
+
+        client.session.get.side_effect = fake_get
+        entries = client.list_tree('/', max_depth=1)
+        assert [item['server_filename'] for _, item in entries[1:]] == ['dir']
 
 
 # ---------------------------------------------------------------------------

@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import shlex
 import sys
@@ -11,13 +12,14 @@ import requests
 from .client import BaiduNetdiskClient
 from .config import Config, NetdiskError
 from .constants import AUTHORIZE_URL, TOKEN_URL
-from .display import print_ls_compact, print_ls_long
-from .utils import make_session, normalize_app_path
+from .display import item_name, print_ls_compact, print_ls_long, print_path_list
+from .utils import _is_dir, human_size, make_session, normalize_app_path
 
 
 # When running inside the interactive shell, holds the in-memory cwd.
 # None means we are in single-command mode; use Config().cwd as usual.
 _shell_cwd: list = []  # list of one str, so it's mutable from nested scopes
+CATEGORY_CHOICES = ('video', 'audio', 'image', 'doc', 'app', 'other', 'bt')
 
 
 def _get_client(args) -> tuple:
@@ -89,7 +91,14 @@ def do_ls(args):
     if args.cwd:
         print(cfg.cwd)
         return
-    items = client.list_dir(args.path or '.')
+    desc = bool(getattr(args, 'desc', False)) and not bool(getattr(args, 'asc', False))
+    items = client.list_dir(
+        args.path or '.',
+        order=getattr(args, 'sort', 'name'),
+        desc=desc,
+        limit=getattr(args, 'limit', 1000),
+        dirs_only=getattr(args, 'dirs_only', False),
+    )
     if args.long:
         print_ls_long(items)
     else:
@@ -184,6 +193,97 @@ def do_mv(args):
     print(f'OK: moved {args.src} -> {args.dst}')
 
 
+def do_cp(args):
+    _, client = _get_client(args)
+    client.copy(args.src, args.dst)
+    print(f'OK: copied {args.src} -> {args.dst}')
+
+
+def _format_time(value) -> str:
+    try:
+        ts = int(value)
+    except (TypeError, ValueError):
+        return '-'
+    return time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(ts)) if ts else '-'
+
+
+def do_meta(args):
+    _, client = _get_client(args)
+    data = client.file_meta(
+        args.path,
+        dlink=args.dlink,
+        thumb=args.thumb,
+        extra=args.extra,
+        needmedia=args.media,
+        detail=args.detail,
+    )
+    if args.json:
+        print(json.dumps(data, ensure_ascii=False, indent=2, sort_keys=True))
+        return
+
+    size = '-' if _is_dir(data) else human_size(int(data.get('size', 0)))
+    rows = [
+        ('path', data.get('path') or client.resolve_app_path(args.path)),
+        ('name', item_name(data)),
+        ('type', 'directory' if _is_dir(data) else 'file'),
+        ('size', size),
+    ]
+    fsid = data.get('fs_id') or data.get('fsid')
+    if fsid is not None:
+        rows.append(('fs_id', fsid))
+    rows.extend([
+        ('server_mtime', _format_time(data.get('server_mtime'))),
+        ('local_mtime', _format_time(data.get('local_mtime'))),
+    ])
+    for key in ('md5', 'dlink', 'thumbs', 'category'):
+        if key in data and data.get(key) not in (None, ''):
+            rows.append((key, data.get(key)))
+    width = max(len(k) for k, _ in rows)
+    for key, value in rows:
+        print(f'{key:<{width}}  {value}')
+
+
+def do_search(args):
+    _, client = _get_client(args)
+    items = client.search(
+        args.keyword,
+        path=args.path,
+        recursive=args.recursive,
+        category=args.type,
+        page=args.page,
+        num=args.num,
+    )
+    print_path_list(items, long=args.long)
+
+
+def do_category(args):
+    _, client = _get_client(args)
+    desc = not bool(args.asc)
+    items = client.category_list(
+        args.type,
+        path=args.path,
+        recursive=args.recursive,
+        page=args.page,
+        num=args.num,
+        order=args.sort,
+        desc=desc,
+    )
+    print_path_list(items, long=args.long)
+
+
+def do_tree(args):
+    _, client = _get_client(args)
+    depth = None if args.depth is None or args.depth < 0 else args.depth
+    entries = client.list_tree(args.path, max_depth=depth, dirs_only=args.dirs_only)
+    for idx, (level, item) in enumerate(entries):
+        if idx == 0:
+            name = client.resolve_app_path(args.path)
+        else:
+            name = item_name(item)
+        suffix = '/' if _is_dir(item) and not name.endswith('/') else ''
+        print(f'{"  " * level}{name}{suffix}')
+
+
 def do_ping(args):
     if args.count < 1:
         raise NetdiskError('--count must be >= 1')
@@ -228,6 +328,13 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser('ls', parents=[common], help='List remote directory')
     sp.add_argument('path', nargs='?', default='.')
     sp.add_argument('-l', '--long', action='store_true', help='Long listing format')
+    sp.add_argument('--sort', choices=('name', 'time', 'size'), default='name',
+                    help='Sort by name, time, or size')
+    order = sp.add_mutually_exclusive_group()
+    order.add_argument('--asc', action='store_true', help='Sort ascending')
+    order.add_argument('--desc', action='store_true', help='Sort descending')
+    sp.add_argument('--dirs-only', action='store_true', help='List directories only')
+    sp.add_argument('--limit', type=int, default=1000, help='Maximum entries to request')
     sp.add_argument('--cwd', action='store_true', help='Print current remote working directory')
     sp.set_defaults(func=do_ls)
 
@@ -263,6 +370,59 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument('src')
     sp.add_argument('dst')
     sp.set_defaults(func=do_mv)
+
+    sp = sub.add_parser('cp', parents=[common], help='Copy remote file or directory')
+    sp.add_argument('src')
+    sp.add_argument('dst')
+    sp.set_defaults(func=do_cp)
+
+    sp = sub.add_parser('meta', parents=[common], help='Show remote file metadata')
+    sp.add_argument('path')
+    sp.add_argument('--json', action='store_true', help='Print raw metadata as JSON')
+    sp.add_argument('--dlink', action='store_true', help='Request a temporary download link')
+    sp.add_argument('--thumb', action='store_true', help='Request thumbnail fields when available')
+    sp.add_argument('--extra', action='store_true', help='Request extra metadata fields')
+    sp.add_argument('--media', action='store_true', help='Request media metadata fields')
+    sp.add_argument('--detail', action='store_true', help='Request detailed metadata fields')
+    sp.set_defaults(func=do_meta)
+
+    sp = sub.add_parser('stat', parents=[common], help='Alias for meta')
+    sp.add_argument('path')
+    sp.add_argument('--json', action='store_true', help='Print raw metadata as JSON')
+    sp.add_argument('--dlink', action='store_true', help='Request a temporary download link')
+    sp.add_argument('--thumb', action='store_true', help='Request thumbnail fields when available')
+    sp.add_argument('--extra', action='store_true', help='Request extra metadata fields')
+    sp.add_argument('--media', action='store_true', help='Request media metadata fields')
+    sp.add_argument('--detail', action='store_true', help='Request detailed metadata fields')
+    sp.set_defaults(func=do_meta)
+
+    sp = sub.add_parser('search', parents=[common], help='Search remote files')
+    sp.add_argument('keyword')
+    sp.add_argument('path', nargs='?', default='.')
+    sp.add_argument('-r', '--recursive', action='store_true', help='Search recursively')
+    sp.add_argument('-l', '--long', action='store_true', help='Long listing format')
+    sp.add_argument('--type', choices=CATEGORY_CHOICES, help='Filter by file type')
+    sp.add_argument('--page', type=int, default=1, help='Result page number')
+    sp.add_argument('--num', type=int, default=500, help='Results per page')
+    sp.set_defaults(func=do_search)
+
+    sp = sub.add_parser('category', parents=[common], help='List files by type')
+    sp.add_argument('type', choices=CATEGORY_CHOICES, help='File type category')
+    sp.add_argument('path', nargs='?', default='.')
+    sp.add_argument('-r', '--recursive', action='store_true', help='List recursively')
+    sp.add_argument('-l', '--long', action='store_true', help='Long listing format')
+    sp.add_argument('--sort', choices=('name', 'time', 'size'), default='time',
+                    help='Sort by name, time, or size')
+    sp.add_argument('--asc', action='store_true', help='Sort ascending')
+    sp.add_argument('--page', type=int, default=1, help='Result page number')
+    sp.add_argument('--num', type=int, default=500, help='Results per page')
+    sp.set_defaults(func=do_category)
+
+    sp = sub.add_parser('tree', parents=[common], help='Print remote directory tree')
+    sp.add_argument('path', nargs='?', default='.')
+    sp.add_argument('--depth', type=int, default=None, help='Maximum depth to print')
+    sp.add_argument('--dirs-only', action='store_true', help='Print directories only')
+    sp.set_defaults(func=do_tree)
 
     sp = sub.add_parser('ping', parents=[common], help='Measure API latency')
     sp.add_argument('-c', '--count', type=int, default=3, metavar='N',
@@ -345,7 +505,7 @@ def _run_interactive():
                 cwd = _shell_cwd[0]
                 if tokens[0] in ('ls', 'cd'):
                     completer.prewarm(cwd)
-                elif tokens[0] in ('mkdir', 'rm', 'mv', 'upload', 'login'):
+                elif tokens[0] in ('mkdir', 'rm', 'mv', 'cp', 'upload', 'login'):
                     completer.invalidate()
                     completer.prewarm(cwd)
             except SystemExit:
