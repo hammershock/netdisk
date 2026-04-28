@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "netdisk-cli"
+version = "0.1.0"
+description = "Baidu Netdisk (百度网盘) command-line tool"
+requires-python = ">=3.8"
+dependencies = ["requests"]
+
+[project.optional-dependencies]
+dev = ["pytest", "pytest-mock"]
+
+[project.scripts]
+netdisk = "netdisk:main"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: requires real Baidu Netdisk credentials (skipped by default)",
+]
