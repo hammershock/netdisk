@@ -127,7 +127,13 @@ class BaiduNetdiskClient:
             return {'isdir': 1, 'path': self.cfg.app_root, 'server_filename': self.cfg.data['app_name']}
         parent = normalize_app_path(os.path.dirname(app_path))
         name = os.path.basename(app_path)
-        for item in self.list_dir(parent):
+        try:
+            items = self.list_dir(parent)
+        except NetdiskError as e:
+            if getattr(e, 'errno', None) == -9:
+                return None
+            raise
+        for item in items:
             if item.get('server_filename') == name:
                 return item
         return None

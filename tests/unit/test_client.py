@@ -187,6 +187,15 @@ class TestMeta:
         client.session.get.return_value = _ok_response({'errno': 0, 'list': []})
         assert client.meta('/missing') is None
 
+    def test_missing_parent_returns_none(self, client):
+        client.session.get.return_value = _error_response(-9, 'dir not found')
+        assert client.meta('/missing/child') is None
+
+    def test_non_missing_api_error_raises(self, client):
+        client.session.get.return_value = _error_response(-6, 'permission denied')
+        with pytest.raises(NetdiskError):
+            client.meta('/some_dir/target.txt')
+
 
 # ---------------------------------------------------------------------------
 # mkdir
